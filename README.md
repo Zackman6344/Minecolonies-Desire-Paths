@@ -47,7 +47,29 @@ In-game:
 /colonypaths builders                      # lists every BuildingBuilder in every colony (Phase 2 enumeration check)
 /colonypaths buildings                     # lists ALL buildings (schematic name + level + position). Use this to cross-check what's on the rendered map.
 /colonypaths seed [radius] [hits]          # stuffs synthetic gaussian samples around you (default radius=8, hits=200) — for testing the viz without waiting for citizens
+/colonypaths build <pack> <path>           # Phase 2 spike: submit ONE WorkOrderDecoration to your colony's builder for the named blueprint at your position. e.g. /colonypaths build medieval_oak roads/roads_straight_01.blueprint
 ```
+
+### Phase 2 spike: `/colonypaths build`
+
+`build` is the proof-of-plumbing for getting Minecolonies builders to actually construct things on our behalf. It mirrors the canonical `DecorationBuildRequestMessage` flow used by Minecolonies' in-game Build Tool:
+
+1. Resolves the colony at your current position (`IColonyManager.getColonyByPosFromDim`).
+2. Loads a blueprint asynchronously via `StructurePacks.getBlueprintFuture(pack, path, registryAccess)`.
+3. When the future completes (on the server thread, via `ServerFutureProcessor.queueBlueprint`), constructs a `WorkOrderDecoration` and submits it to `colony.getWorkManager().addWorkOrder(...)`.
+4. Your colony's builder picks it up on the next colony tick and builds it like any other commissioned decoration.
+
+The pack/path are the same strings the in-game Build Tool uses. Minecolonies ships road blueprints across every default style — useful candidates to test with:
+
+```
+/colonypaths build medieval_oak    roads/roads_straight_01.blueprint
+/colonypaths build medieval_oak    roads/roads_turn_01.blueprint
+/colonypaths build medieval_oak    roads/roads_crossroads_01.blueprint
+/colonypaths build incan           decorations/pathshort.blueprint
+/colonypaths build asian           roads/roads_straight_01.blueprint
+```
+
+Exact pack names and structure paths depend on what Structurize has loaded — if a path doesn't resolve you'll get "Blueprint not found" in chat with the same string echoed in the server log. The fastest way to find a working pack/path: open Minecolonies' Build Tool in-game, navigate to a decoration, and read the pack name + relative path from the GUI.
 
 **Citizen tracking is always on** — no command to start/stop it. The tracker fires every 20 server ticks (1s) and samples every loaded citizen in every colony. To see real data accumulate, found a colony and let the citizens go about their day for a few minutes, then `/colonypaths render`. To see the visualization immediately with fake data, use `/colonypaths seed` first.
 

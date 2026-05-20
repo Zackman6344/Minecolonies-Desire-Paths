@@ -36,6 +36,19 @@ repositories {
             includeGroup('com.minecolonies')
         }
     }
+    // CurseMaven — needed for Structurize. Minecolonies declares Structurize as a runtime
+    // dependency only, so we need it on the compile classpath ourselves to call the
+    // com.ldtteam.structurize.* API (StructurePacks, ServerFutureProcessor, RotationMirror,
+    // Blueprint). LDTTeam's JFrog has Structurize too but its latest 1.21.1 build is older
+    // than what Minecolonies 1.1.1300 actually links against, hence CurseMaven for an
+    // exact-match file ID.
+    maven {
+        name = 'CurseMaven'
+        url = 'https://cursemaven.com'
+        content {
+            includeGroup('curse.maven')
+        }
+    }
 }
 
 base {
@@ -152,6 +165,10 @@ dependencies {
     // the dev client/server via localRuntime so we don't impose it on downstream consumers.
     compileOnly "com.ldtteam:minecolonies:${minecolonies_version}"
     localRuntime "com.ldtteam:minecolonies:${minecolonies_version}"
+
+    // Structurize — pinned to the CurseForge file ID that Minecolonies 1.1.1300 resolves
+    // transitively at runtime. Bump this when bumping minecolonies_version.
+    compileOnly "curse.maven:structurize-298744:${structurize_curse_file}"
 }
 
 // This block of code expands all declared replace properties in the specified resource targets.

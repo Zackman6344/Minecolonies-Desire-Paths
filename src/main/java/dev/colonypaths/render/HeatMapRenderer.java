@@ -6,6 +6,7 @@ import com.minecolonies.api.colony.buildings.IBuilding;
 import com.minecolonies.core.colony.buildings.workerbuildings.BuildingBuilder;
 import dev.colonypaths.ColonyPaths;
 import dev.colonypaths.heatmap.HeatMap;
+import dev.colonypaths.path.PathExtractor;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.level.storage.LevelResource;
@@ -36,6 +37,7 @@ public final class HeatMapRenderer {
     }
 
     private static final int HEADER_H = 28;
+    private static final int FOOTER_H = 18;
     private static final int LEGEND_W = 90;
 
     private static final Color BG = new Color(0x1A, 0x1A, 0x1A);
@@ -50,13 +52,30 @@ public final class HeatMapRenderer {
     private static final Color RESIDENCE_FILL = new Color(0x70, 0xD0, 0x60);
     private static final Color OTHER_BUILDING_FILL = new Color(0x60, 0xA8, 0xFF);
     private static final Color CROSSHAIR = new Color(0xC8, 0xFF, 0x00);
+    private static final Color PATH_OVERLAY = new Color(0x00, 0xE0, 0xFF);  // bright cyan, distinct from heat gradient
 
     public static RenderResult renderToPng(MinecraftServer server, BlockPos center, int radius) throws IOException {
+        return renderToPng(server, center, radius, null, null);
+    }
+
+    public static RenderResult renderToPng(MinecraftServer server, BlockPos center, int radius,
+                                           PathExtractor.Skeleton overlay) throws IOException {
+        return renderToPng(server, center, radius, overlay, null);
+    }
+
+    // Overload that paints a PathExtractor.Skeleton over the heatmap and under the building
+    // markers (so the proposed path's cells are visible against heat, but markers/crosshair
+    // remain readable on top). `overlay == null` is identical to the no-overlay signature.
+    // `commandLabel == null/empty` skips the footer; otherwise it's rendered monospaced at
+    // the bottom of the image so the PNG is self-documenting about how it was generated.
+    public static RenderResult renderToPng(MinecraftServer server, BlockPos center, int radius,
+                                           PathExtractor.Skeleton overlay, String commandLabel) throws IOException {
+        boolean showFooter = commandLabel != null && !commandLabel.isEmpty();
         int blocksWide = 2 * radius + 1;
         int pixelScale = Math.max(2, Math.min(8, 512 / blocksWide));
         int mapSize = blocksWide * pixelScale;
         int totalWidth = mapSize + LEGEND_W;
-        int totalHeight = mapSize + HEADER_H;
+        int totalHeight = mapSize + HEADER_H + (showFooter ? FOOTER_H : 0);
 
         int peak = Math.max(1, HeatMap.get().peak());
 
@@ -75,26 +94,62 @@ public final class HeatMapRenderer {
             int mapX = 0, mapY = HEADER_H;
             drawMapBackground(g, mapX, mapY, mapSize, blocksWide, pixelScale, center, radius);
             drawHeatmap(g, mapX, mapY, mapSize, blocksWide, center, radius, peak);
+            if (overlay != null) {
+                drawSkeleton(g, mapX, mapY, pixelScale, overlay);
+            }
             drawBuildings(g, mapX, mapY, pixelScale, center, radius, counts);
             drawCrosshair(g, mapX + radius * pixelScale + pixelScale / 2, mapY + radius * pixelScale + pixelScale / 2);
             drawNorthArrow(g, mapX + 8, mapY + 8);
             drawScaleBar(g, mapX, mapY, mapSize, pixelScale);
             drawCornerCoords(g, mapX, mapY, mapSize, center, radius);
 
-            drawLegend(g, mapX + mapSize, HEADER_H, LEGEND_W, mapSize, peak);
+            drawLegend(g, mapX + mapSize, HEADER_H, LEGEND_W, mapSize, peak, overlay != null);
+            if (showFooter) {
+                drawFooter(g, totalWidth, HEADER_H + mapSize, commandLabel);
+            }
         } finally {
             g.dispose();
         }
 
         Path outDir = server.getWorldPath(LevelResource.ROOT).resolve("colonypaths");
         Files.createDirectories(outDir);
-        String filename = "heatmap_" + center.getX() + "_" + center.getZ() + "_r" + radius
+        String prefix = (overlay != null) ? "preview" : "heatmap";
+        String filename = prefix + "_" + center.getX() + "_" + center.getZ() + "_r" + radius
                 + "_" + LocalDateTime.now().format(FILE_TS) + ".png";
         Path outPath = outDir.resolve(filename);
         if (!ImageIO.write(img, "PNG", outPath.toFile())) {
             throw new IOException("No PNG ImageWriter available in this JVM");
         }
         return new RenderResult(outPath, counts[0], counts[1], counts[2], counts[3], counts[4]);
+    }
+
+    private static void drawSkeleton(Graphics2D g, int mapX, int mapY, int pixelScale,
+                                     PathExtractor.Skeleton skel) {
+        int radius = skel.radius;
+        int side = 2 * radius + 1;
+        // Slight alpha so very bright peak cells underneath are still visible through the path.
+        Color cellColor = new Color(PATH_OVERLAY.getRed(), PATH_OVERLAY.getGreen(), PATH_OVERLAY.getBlue(), 220);
+        g.setColor(cellColor);
+        for (int x = 0; x < side; x++) {
+            for (int z = 0; z < side; z++) {
+                if (skel.mask[x][z]) {
+                    g.fillRect(mapX + x * pixelScale, mapY + z * pixelScale, pixelScale, pixelScale);
+                }
+            }
+        }
+    }
+
+    private static void drawFooter(Graphics2D g, int width, int y, String commandLabel) {
+        g.setColor(HEADER_BG);
+        g.fillRect(0, y, width, FOOTER_H);
+        g.setColor(HEADER_SEP);
+        g.fillRect(0, y, width, 1);
+
+        g.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
+        g.setColor(TEXT_DIM);
+        g.drawString("cmd:", 8, y + 13);
+        g.setColor(TEXT_BRIGHT);
+        g.drawString(commandLabel, 36, y + 13);
     }
 
     private static void drawHeader(Graphics2D g, int width, BlockPos center, int radius, int peak) {
@@ -293,7 +348,7 @@ public final class HeatMapRenderer {
         g.drawString(br, mapX + mapSize - brWidth - 3, mapY + 12);
     }
 
-    private static void drawLegend(Graphics2D g, int x, int y, int width, int height, int peak) {
+    private static void drawLegend(Graphics2D g, int x, int y, int width, int height, int peak, boolean showPath) {
         int barX = x + 14;
         int barY = y + 32;
         int barW = 18;
@@ -327,8 +382,14 @@ public final class HeatMapRenderer {
         drawKeyEntry(g, TOWNHALL_FILL, "Town Hall", barX, keyY + 14);
         drawKeyEntry(g, RESIDENCE_FILL, "Residence", barX, keyY + 28);
         drawKeyEntry(g, OTHER_BUILDING_FILL, "Other", barX, keyY + 42);
-        g.setColor(CROSSHAIR);
-        g.drawString("+ you (center)", barX, keyY + 56);
+        if (showPath) {
+            drawKeyEntry(g, PATH_OVERLAY, "Proposed path", barX, keyY + 56);
+            g.setColor(CROSSHAIR);
+            g.drawString("+ you (center)", barX, keyY + 70);
+        } else {
+            g.setColor(CROSSHAIR);
+            g.drawString("+ you (center)", barX, keyY + 56);
+        }
     }
 
     private static void drawKeyEntry(Graphics2D g, Color fill, String label, int x, int y) {

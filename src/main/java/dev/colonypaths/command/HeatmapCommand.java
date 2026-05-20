@@ -1,24 +1,33 @@
 package dev.colonypaths.command;
 
+import com.ldtteam.structurize.api.RotationMirror;
+import com.ldtteam.structurize.blueprints.v1.Blueprint;
+import com.ldtteam.structurize.storage.ServerFutureProcessor;
+import com.ldtteam.structurize.storage.StructurePacks;
 import com.minecolonies.api.IMinecoloniesAPI;
 import com.minecolonies.api.colony.IColony;
 import com.minecolonies.api.colony.buildings.IBuilding;
+import com.minecolonies.api.colony.workorders.WorkOrderType;
 import com.minecolonies.core.colony.buildings.workerbuildings.BuildingBuilder;
+import com.minecolonies.core.colony.workorders.WorkOrderDecoration;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import dev.colonypaths.ColonyPaths;
 import dev.colonypaths.heatmap.HeatMap;
+import dev.colonypaths.path.PathExtractor;
 import dev.colonypaths.render.HeatMapRenderer;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerLevel;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.event.RegisterCommandsEvent;
 
-import java.nio.file.Path;
 import java.util.Random;
+import java.util.concurrent.CompletableFuture;
 
 // /colonypaths heatmap [radius]  — dumps an ASCII heatmap around the caller's position.
 //   Output goes to the server log (monospaced) and a short summary to chat.
@@ -57,8 +66,80 @@ public final class HeatmapCommand {
                         .executes(ctx -> render(ctx.getSource(), 64))
                         .then(Commands.argument("radius", IntegerArgumentType.integer(8, 256))
                                 .executes(ctx -> render(ctx.getSource(), IntegerArgumentType.getInteger(ctx, "radius")))))
+                .then(Commands.literal("preview")
+                        .executes(ctx -> preview(ctx.getSource(), 64, -1))
+                        .then(Commands.argument("radius", IntegerArgumentType.integer(8, 256))
+                                .executes(ctx -> preview(ctx.getSource(), IntegerArgumentType.getInteger(ctx, "radius"), -1))
+                                .then(Commands.argument("threshold", IntegerArgumentType.integer(1, 100000))
+                                        .executes(ctx -> preview(ctx.getSource(),
+                                                IntegerArgumentType.getInteger(ctx, "radius"),
+                                                IntegerArgumentType.getInteger(ctx, "threshold"))))))
                 .then(Commands.literal("buildings")
-                        .executes(ctx -> listAllBuildings(ctx.getSource()))));
+                        .executes(ctx -> listAllBuildings(ctx.getSource())))
+                .then(Commands.literal("build")
+                        .then(Commands.argument("pack", StringArgumentType.string())
+                                .then(Commands.argument("path", StringArgumentType.greedyString())
+                                        .executes(ctx -> submitBuildOrder(
+                                                ctx.getSource(),
+                                                StringArgumentType.getString(ctx, "pack"),
+                                                StringArgumentType.getString(ctx, "path")))))));
+    }
+
+    // Phase 2 spike: submit a single WorkOrderDecoration to a Minecolonies builder at the
+    // caller's position, using a blueprint from the named pack+path. Built-in candidates:
+    //   /colonypaths build medieval_oak roads/roads_straight_01.blueprint
+    //   /colonypaths build incan        decorations/pathshort.blueprint
+    // Exact pack/path strings depend on what's loaded; use Minecolonies' Build Tool in-game
+    // to discover names that work, then pass them here.
+    //
+    // Flow mirrors DecorationBuildRequestMessage in Minecolonies: load the blueprint via
+    // StructurePacks (async), queue the result, and in the callback build the
+    // WorkOrderDecoration and submit it to the colony's work manager. The builder NPC picks
+    // it up on the next colony tick.
+    private static int submitBuildOrder(CommandSourceStack source, String pack, String path) {
+        try {
+            BlockPos pos = BlockPos.containing(source.getPosition());
+            ServerLevel level = source.getLevel();
+            IColony colony = IMinecoloniesAPI.getInstance().getColonyManager()
+                    .getColonyByPosFromDim(level.dimension(), pos);
+            if (colony == null) {
+                source.sendFailure(Component.literal("No colony claims this position."));
+                return 0;
+            }
+
+            CompletableFuture<Blueprint> future = StructurePacks.getBlueprintFuture(
+                    pack, path, level.registryAccess());
+
+            ServerFutureProcessor.queueBlueprint(new ServerFutureProcessor.BlueprintProcessingData(
+                    future, level, blueprint -> {
+                if (blueprint == null) {
+                    ColonyPaths.LOGGER.error("Blueprint not found: {} / {}", pack, path);
+                    source.sendFailure(Component.literal("Blueprint not found: " + pack + " / " + path));
+                    return;
+                }
+                String label = lastSegmentNoExt(path);
+                WorkOrderDecoration order = WorkOrderDecoration.create(
+                        WorkOrderType.BUILD, pack, path, label, pos, RotationMirror.NONE, 0);
+                order.setBlueprint(blueprint, level);
+                colony.getWorkManager().addWorkOrder(order, false);
+                source.sendSuccess(() -> Component.literal(
+                        "Work order submitted: " + label + " at " + pos.getX() + "," + pos.getZ()
+                                + " in colony #" + colony.getID()), false);
+            }));
+
+            source.sendSuccess(() -> Component.literal("Queued blueprint load: " + pack + " / " + path), false);
+            return 1;
+        } catch (Throwable e) {
+            ColonyPaths.LOGGER.error("build command failed", e);
+            source.sendFailure(Component.literal("build failed: " + e));
+            return 0;
+        }
+    }
+
+    private static String lastSegmentNoExt(String path) {
+        int slash = path.lastIndexOf('/');
+        String last = (slash >= 0) ? path.substring(slash + 1) : path;
+        return last.replace(".blueprint", "");
     }
 
     // Comprehensive listing of every building in every colony (vs `builders` which only shows builder huts).
@@ -87,13 +168,47 @@ public final class HeatmapCommand {
         }
     }
 
+    // Phase 2 spike, stage 1: extract a 1-block-wide skeleton from the heatmap (threshold +
+    // Zhang-Suen thinning) and render it as a cyan overlay on top of the normal map view.
+    // `threshold < 0` means auto (PathExtractor.defaultThreshold(peak)).
+    // PNG filename gets a `preview_` prefix so it doesn't overwrite plain renders.
+    private static int preview(CommandSourceStack source, int radius, int explicitThreshold) {
+        try {
+            BlockPos center = BlockPos.containing(source.getPosition());
+            int peak = Math.max(1, HeatMap.get().peak());
+            int threshold = (explicitThreshold > 0) ? explicitThreshold : PathExtractor.defaultThreshold(peak);
+            PathExtractor.Skeleton skel = PathExtractor.extract(center, radius, threshold);
+            String cmd = "/colonypaths preview " + radius
+                    + (explicitThreshold > 0 ? (" " + explicitThreshold) : "  (auto threshold=" + threshold + ")");
+            HeatMapRenderer.RenderResult r = HeatMapRenderer.renderToPng(
+                    source.getServer(), center, radius, skel, cmd);
+            source.sendSuccess(() -> Component.literal("PNG: " + r.path().toAbsolutePath()), false);
+            source.sendSuccess(() -> Component.literal(
+                    "Preview: threshold=" + threshold + " (peak=" + peak + "), "
+                            + skel.cellCount + " skeleton cells. "
+                            + "Masked: " + skel.maskedBuildingCells + " cells / "
+                            + skel.maskedBuildings + " buildings, "
+                            + skel.maskedFieldCells + " cells / "
+                            + skel.maskedFields + " fields. "
+                            + r.totalDrawn() + " buildings drawn, "
+                            + r.outsideRadius() + " outside radius."), false);
+            return 1;
+        } catch (Throwable e) {
+            ColonyPaths.LOGGER.error("Preview failed", e);
+            source.sendFailure(Component.literal("Preview failed: " + e));
+            return 0;
+        }
+    }
+
     // Writes a PNG to <world>/colonypaths/heatmap_<x>_<z>_r<radius>_<ts>.png with the heatmap,
     // color-coded building markers, and a player crosshair at the caller's position.
     // Chat message reports per-category counts so you can spot missing-building issues without re-reading the image.
     private static int render(CommandSourceStack source, int radius) {
         try {
             BlockPos center = BlockPos.containing(source.getPosition());
-            HeatMapRenderer.RenderResult r = HeatMapRenderer.renderToPng(source.getServer(), center, radius);
+            String cmd = "/colonypaths render " + radius;
+            HeatMapRenderer.RenderResult r = HeatMapRenderer.renderToPng(
+                    source.getServer(), center, radius, null, cmd);
             source.sendSuccess(() -> Component.literal("PNG: " + r.path().toAbsolutePath()), false);
             source.sendSuccess(() -> Component.literal(
                     "Drew " + r.totalDrawn() + " buildings ("
